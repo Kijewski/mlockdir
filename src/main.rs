@@ -140,10 +140,8 @@ enum Error {
     Unmap(#[source] io::Errno),
 }
 
-type InosMap = AHashMap<(usize, u64), usize>; // (path idx, ino) -> file size
-
 fn map_all_files(
-    dfds: &[fd::OwnedFd],
+    dfds: &[Dfd],
     map_start: *mut c_void,
     map_end: &mut *mut c_void,
     readdir_buf: &mut Vec<u8>,
@@ -160,16 +158,8 @@ fn map_all_files(
 
     let page_size = param::page_size();
     let mut map_pos = map_start;
-    for (idx, dfd) in dfds.iter().enumerate() {
-        map_files(
-            idx,
-            dfd.as_fd(),
-            page_size,
-            &mut map_pos,
-            readdir_buf,
-            inos,
-            file_count,
-        )?;
+    for dfd in dfds.iter() {
+        map_files(dfd, page_size, &mut map_pos, readdir_buf, inos, file_count)?;
     }
     if map_pos.cast() == map_start {
         return Err(Error::NothingReserved);
@@ -185,14 +175,14 @@ fn map_all_files(
     Ok(())
 }
 
-fn collect_directory_fds() -> Result<Vec<fd::OwnedFd>, Error> {
+fn collect_directory_fds() -> Result<Vec<Dfd>, Error> {
     let cwd = open_cwd()?;
 
     let mut paths = args_os().fuse();
     let _ = paths.next();
-    let mut dfds = Vec::with_capacity(paths.size_hint().0.min(32));
+    let mut dfds = Vec::with_capacity(paths.size_hint().0.max(1));
 
-    let mut seen_dirs = AHashSet::new();
+    let mut seen_dirs = AHashSet::with_capacity(paths.size_hint().0);
     for path in paths {
         let oflags = fs::OFlags::RDONLY | fs::OFlags::DIRECTORY | fs::OFlags::CLOEXEC;
         let mode = fs::Mode::empty();
@@ -202,26 +192,36 @@ fn collect_directory_fds() -> Result<Vec<fd::OwnedFd>, Error> {
             Err(err) => return Err(Error::OpenDir(err, path.into())),
         };
 
-        let flags =
-            fs::AtFlags::NO_AUTOMOUNT | fs::AtFlags::STATX_SYNC_AS_STAT | fs::AtFlags::EMPTY_PATH;
-        let mask = fs::StatxFlags::INO;
-        let stats = match fs::statx(&dfd, cstr!(""), flags, mask) {
-            Ok(stats) => stats,
-            Err(err) => return Err(Error::StatDir(Some(err), path.into())),
+        let key = match dir_ino(dfd.as_fd()) {
+            Ok(key) => key,
+            Err(err) => return Err(Error::StatDir(err, path.into())),
         };
-        if stats.stx_mask & mask.bits() != mask.bits() {
-            return Err(Error::StatDir(None, path.into()));
-        }
-
-        if seen_dirs.insert((stats.stx_dev_major, stats.stx_dev_minor, stats.stx_ino)) {
-            dfds.push(dfd);
+        if seen_dirs.insert(key) {
+            dfds.push(((key.0, key.1), dfd));
         }
     }
 
-    match dfds.is_empty() {
-        true => Ok(vec![cwd]),
-        false => Ok(dfds),
+    if dfds.is_empty() {
+        let key = match dir_ino(cwd.as_fd()) {
+            Ok(key) => key,
+            Err(err) => return Err(Error::StatDir(err, ".".into())),
+        };
+        dfds.push(((key.0, key.1), cwd));
     }
+
+    Ok(dfds)
+}
+
+fn dir_ino(dfd: fd::BorrowedFd<'_>) -> Result<(u32, u32, u64), Option<io::Errno>> {
+    let flags =
+        fs::AtFlags::NO_AUTOMOUNT | fs::AtFlags::STATX_SYNC_AS_STAT | fs::AtFlags::EMPTY_PATH;
+    let mask = fs::StatxFlags::INO;
+    let stats = fs::statx(dfd, cstr!(""), flags, mask).map_err(Some)?;
+    if stats.stx_mask & mask.bits() != mask.bits() {
+        return Err(None);
+    }
+
+    Ok((stats.stx_dev_major, stats.stx_dev_minor, stats.stx_ino))
 }
 
 fn open_cwd() -> Result<fd::OwnedFd, Error> {
@@ -259,7 +259,7 @@ fn allocate_empty_map(total_len: usize) -> Result<(*mut c_void, *mut c_void), Er
 }
 
 fn enumerate_all_files(
-    dfds: &[fd::OwnedFd],
+    dfds: &[Dfd],
     inos: &mut InosMap,
     readdir_buf: &mut Vec<u8>,
     total_len: &mut usize,
@@ -271,9 +271,9 @@ fn enumerate_all_files(
     let start = Instant::now();
 
     let page_size = param::page_size();
-    for (idx, dfd) in dfds.iter().enumerate() {
-        enumerate_files(idx, dfd.as_fd(), page_size, inos, readdir_buf, total_len)?;
-        let _ = fs::seek(dfd, fs::SeekFrom::Start(0)).map_err(Error::Rewind)?;
+    for dfd in dfds.iter() {
+        enumerate_files(dfd, page_size, inos, readdir_buf, total_len)?;
+        let _ = fs::seek(&dfd.1, fs::SeekFrom::Start(0)).map_err(Error::Rewind)?;
     }
 
     write(format_args!(" {:.2?}\n", start.elapsed()));
@@ -281,16 +281,18 @@ fn enumerate_all_files(
 }
 
 fn enumerate_files(
-    idx: usize,
-    dfd: fd::BorrowedFd<'_>,
+    dfd: &Dfd,
     page_size: usize,
     inos: &mut InosMap,
     readdir_buf: &mut Vec<u8>,
     total_len: &mut usize,
 ) -> Result<(), Error> {
-    next_entry(dfd.as_fd(), readdir_buf, &mut |entry| {
+    let &(device, ref dfd) = dfd;
+    let dfd = dfd.as_fd();
+
+    next_entry(dfd, readdir_buf, &mut |entry| {
         // no already handled INOs
-        let key = (idx, entry.ino());
+        let key = (device, entry.ino());
         if inos.contains_key(&key) {
             return Ok(());
         }
@@ -313,19 +315,20 @@ fn enumerate_files(
 }
 
 fn map_files(
-    idx: usize,
-    dfd: fd::BorrowedFd<'_>,
+    dfd: &Dfd,
     page_size: usize,
     map_start: &mut *mut c_void,
     readdir_buf: &mut Vec<u8>,
     inos: &mut InosMap,
     file_count: &mut usize,
 ) -> Result<(), Error> {
+    let &(device, ref dfd) = dfd;
+    let dfd = dfd.as_fd();
     let mut map_pos = map_start.cast::<u8>();
 
-    next_entry(dfd.as_fd(), readdir_buf, &mut |entry| {
+    next_entry(dfd, readdir_buf, &mut |entry| {
         // only seen INOs
-        let key = (idx, entry.ino());
+        let key = (device, entry.ino());
         let Some(reserved_size) = inos.remove(&key) else {
             return Ok(());
         };
@@ -565,3 +568,7 @@ fn write(content: Arguments<'_>) {
     }
     let _ = termios::tcdrain(fd);
 }
+
+type InosMap = AHashMap<(Device, u64), usize>; // (Device, ino) -> file size
+type Dfd = (Device, fd::OwnedFd); // (Device, fd)
+type Device = (u32, u32); // (dev major, dev minor)
