@@ -126,10 +126,6 @@ enum Error {
     TooManyFiles,
     #[error("Did not lock any files")]
     NothingReserved,
-    #[error("Could not get file status for STDIN")]
-    StdinGetFl(#[source] io::Errno),
-    #[error("Could not set file status for STDIN")]
-    StdinSetFl(#[source] io::Errno),
     #[error("Could not set terminal attributes for STDIN")]
     StdinSetAttrs(#[source] io::Errno),
     #[error("Could not read from STDIN")]
@@ -495,12 +491,6 @@ fn pause() -> Result<(), Error> {
             let _ = termios::tcsetattr(fd, termios::OptionalActions::Now, &attrs);
         });
 
-        // set STDIN to non blocking
-        let fl = fs::fcntl_getfl(fd).map_err(Error::StdinGetFl)?;
-        if !fl.contains(fs::OFlags::NONBLOCK) {
-            fs::fcntl_setfl(fd, fl | fs::OFlags::NONBLOCK).map_err(Error::StdinSetFl)?;
-        }
-
         // await input
         let events = event::PollFlags::IN
             | event::PollFlags::PRI
@@ -513,11 +503,6 @@ fn pause() -> Result<(), Error> {
         match event::poll(&mut [event::PollFd::new(&fd, events)], -1) {
             Ok(_) | Err(io::Errno::WOULDBLOCK) | Err(io::Errno::INTR) => (),
             Err(err) => return Err(Error::StdinRead(err)),
-        }
-
-        // set STDIN to blocking, again
-        if !fl.contains(fs::OFlags::NONBLOCK) {
-            let _ = fs::fcntl_setfl(fd, fl);
         }
 
         // reset changes to terminal
