@@ -472,6 +472,9 @@ fn pause() -> Result<(), Error> {
             "Files locked ... Press any key to terminate.\n",
         ));
 
+        // clear any stray input from STDIN
+        let _ = termios::tcflush(fd, termios::QueueSelector::IFlush);
+
         // set STDIN to trap ctrl+c, etc., disable line mode, don't echo input
         let mut new_attrs = attrs.clone();
         for idx in [
